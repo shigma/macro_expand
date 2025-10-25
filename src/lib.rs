@@ -1,4 +1,9 @@
-#![doc = include_str!("../README.md")]
+//! # macro_expand
+//!
+//! A Rust library for expanding procedural macros in-place. It allows you to register custom procedural macros and
+//! apply them to Rust source code programmatically. This is particularly useful for testing procedural macros by
+//! comparing their output against expected snapshots.
+//!
 //! ## Example
 //!
 //! When developing procedural macros, it's recommended to implement your macro logic using [`proc_macro2`] instead of
