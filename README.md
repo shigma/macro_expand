@@ -55,7 +55,7 @@ mod test {
     fn fixtures() {
         let mut ctx = Context::new();
         // Register the inner implementation using testable implementation
-        ctx.register_proc_macro_derive("MyTrait".into(), derive_my_trait_inner, vec![]);
+        ctx.proc_macro_derive("MyTrait".into(), derive_my_trait_inner, vec![]);
         let input = read_to_string("fixtures/input.rs").unwrap().parse().unwrap();
         let output = ctx.transform(input);
         let expected = read_to_string("fixtures/output.rs").unwrap().parse().unwrap();

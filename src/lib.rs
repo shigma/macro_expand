@@ -1,3 +1,5 @@
+#![allow(clippy::test_attr_in_doctest)]
+
 //! # macro_expand
 //!
 //! A Rust library for expanding procedural macros in-place. It allows you to register custom procedural macros and
@@ -48,7 +50,7 @@
 //!     fn fixtures() {
 //!         let mut ctx = Context::new();
 //!         // Register the inner implementation using testable implementation
-//!         ctx.register_proc_macro_derive("MyTrait".into(), derive_my_trait_inner, vec![]);
+//!         ctx.proc_macro_derive("MyTrait".into(), derive_my_trait_inner, vec![]);
 //!         let input = read_to_string("fixtures/input.rs").unwrap().parse().unwrap();
 //!         let output = ctx.transform(input);
 //!         let expected = read_to_string("fixtures/output.rs").unwrap().parse().unwrap();
@@ -97,7 +99,7 @@ impl<'i> Context<'i> {
     ///
     /// The macro will be invoked when encountered in expression or type position with the syntax `macro_name!(...)`,
     /// `macro_name![...]` or `macro_name!{...}`.
-    pub fn register_proc_macro<F, T>(&mut self, ident: String, f: F) -> &mut Self
+    pub fn proc_macro<F, T>(&mut self, ident: String, f: F) -> &mut Self
     where
         F: Fn(T) -> TokenStream + 'i,
         T: Parse,
@@ -116,16 +118,20 @@ impl<'i> Context<'i> {
     ///
     /// The macro will be invoked when used as an attribute on items with the syntax `#[macro_name]` or
     /// `#[macro_name(...)]`.
-    pub fn register_proc_macro_attribute<F, T>(&mut self, ident: String, f: F) -> &mut Self
+    pub fn proc_macro_attribute<F, T, U>(&mut self, ident: String, f: F) -> &mut Self
     where
-        F: Fn(T, TokenStream) -> TokenStream + 'i,
+        F: Fn(T, U) -> TokenStream + 'i,
         T: Parse,
+        U: Parse,
     {
         self.registry.insert(
             ident,
-            Item::ProcMacroAttribute(Box::new(move |input, meta| match syn::parse2(input) {
-                Ok(input) => f(input, meta),
-                Err(err) => err.to_compile_error(),
+            Item::ProcMacroAttribute(Box::new(move |input, meta| {
+                match (syn::parse2(input), syn::parse2(meta)) {
+                    (Ok(input), Ok(meta)) => f(input, meta),
+                    (Err(err), _) => err.to_compile_error(),
+                    (_, Err(err)) => err.to_compile_error(),
+                }
             })),
         );
         self
@@ -135,7 +141,7 @@ impl<'i> Context<'i> {
     ///
     /// The macro will be invoked when used in a `#[derive(...)]` attribute. Generated implementations will be added
     /// after the original item.
-    pub fn register_proc_macro_derive<F, T>(&mut self, ident: String, f: F, attributes: Vec<String>) -> &mut Self
+    pub fn proc_macro_derive<F, T>(&mut self, ident: String, f: F, attributes: Vec<String>) -> &mut Self
     where
         F: Fn(T) -> TokenStream + 'i,
         T: Parse,
