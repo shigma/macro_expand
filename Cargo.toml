@@ -1,6 +1,6 @@
 [package]
 name = "macro_expand"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 authors = ["Shigma <shigma10826@gmail.com>"]
@@ -10,6 +10,6 @@ documentation = "https://docs.rs/macro_expand"
 
 [dependencies]
 itertools = "0.14.0"
-proc-macro2 = "1.0.103"
-quote = "1.0.41"
-syn = { version = "2.0.108", features = ["full", "visit-mut"] }
+proc-macro2 = "1.0.106"
+quote = "1.0.45"
+syn = { version = "2.0.117", features = ["full", "visit-mut"] }
