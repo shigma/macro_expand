@@ -106,6 +106,8 @@ struct ScopeFrame {
     /// e.g. `use foo::bar;` → { "bar" → ["foo", "bar"] }
     /// e.g. `use foo::bar as qux;` → { "qux" → ["foo", "bar"] }
     imports: HashMap<String, Vec<String>>,
+    /// Glob import prefixes, e.g. `use foo::*;` → [["foo"]].
+    globs: Vec<Vec<String>>,
 }
 
 impl ScopeFrame {
@@ -113,6 +115,7 @@ impl ScopeFrame {
         Self {
             kind,
             imports: HashMap::new(),
+            globs: Vec::new(),
         }
     }
 
@@ -143,7 +146,7 @@ impl ScopeFrame {
                 }
             }
             syn::UseTree::Glob(_) => {
-                // Glob imports are not supported yet.
+                self.globs.push(prefix.to_vec());
             }
         }
     }
@@ -258,9 +261,19 @@ impl<'i> Context<'i> {
     /// Resolve a name by looking it up in the global registry first,
     /// then walking the scope stack (respecting block vs. module boundaries).
     fn resolve<'a>(&'a self, name: &str, scopes: &[ScopeFrame]) -> Option<&'a Item<'i>> {
+        // Walk scopes from innermost to outermost, stopping at module boundaries.
         for scope in scopes.iter().rev() {
+            // Explicit imports take priority over globs.
             if let Some(segments) = scope.imports.get(name) {
                 return self.resolve_path(segments);
+            }
+            // Try glob imports: check if any glob prefix contains this name.
+            for glob_prefix in &scope.globs {
+                let mut full_path = glob_prefix.clone();
+                full_path.push(name.to_string());
+                if let Some(item) = self.resolve_path(&full_path) {
+                    return Some(item);
+                }
             }
             if scope.kind == ScopeKind::Module {
                 break;
