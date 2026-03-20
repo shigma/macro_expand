@@ -82,11 +82,89 @@ enum Item<'i> {
 
 /// A context for registering and expanding procedural macros.
 ///
-/// The `Context` holds a registry of macro implementations and provides methods to transform Rust source code by
+/// The [`Context`] holds a registry of macro implementations and provides methods to transform Rust source code by
 /// expanding these macros.
 #[derive(Default)]
 pub struct Context<'i> {
     registry: HashMap<String, Item<'i>>,
+    modules: HashMap<String, Context<'i>>,
+}
+
+/// The kind of scope frame, determining use-import visibility.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScopeKind {
+    /// Block scope (fn body, `{}`): inherits outer imports.
+    Block,
+    /// Module scope (`mod`): isolates imports; outer imports are not visible.
+    Module,
+}
+
+/// A scope frame tracking `use` imports at a given nesting level.
+struct ScopeFrame {
+    kind: ScopeKind,
+    /// Maps local name → full path segments.
+    /// e.g. `use foo::bar;` → { "bar" → ["foo", "bar"] }
+    /// e.g. `use foo::bar as qux;` → { "qux" → ["foo", "bar"] }
+    imports: HashMap<String, Vec<String>>,
+}
+
+impl ScopeFrame {
+    fn new(kind: ScopeKind) -> Self {
+        Self {
+            kind,
+            imports: HashMap::new(),
+        }
+    }
+
+    /// Collect use imports from a `UseTree` into a scope frame.
+    fn collect_use_tree(&mut self, prefix: &[String], tree: &syn::UseTree) {
+        match tree {
+            syn::UseTree::Path(use_path) => {
+                let mut new_prefix = prefix.to_vec();
+                new_prefix.push(use_path.ident.to_string());
+                self.collect_use_tree(&new_prefix, &use_path.tree);
+            }
+            syn::UseTree::Name(use_name) => {
+                let ident = use_name.ident.to_string();
+                let mut segments = prefix.to_vec();
+                segments.push(ident.clone());
+                self.imports.insert(ident, segments);
+            }
+            syn::UseTree::Rename(use_rename) => {
+                let original = use_rename.ident.to_string();
+                let alias = use_rename.rename.to_string();
+                let mut segments = prefix.to_vec();
+                segments.push(original);
+                self.imports.insert(alias, segments);
+            }
+            syn::UseTree::Group(use_group) => {
+                for item in &use_group.items {
+                    self.collect_use_tree(prefix, item);
+                }
+            }
+            syn::UseTree::Glob(_) => {
+                // Glob imports are not supported yet.
+            }
+        }
+    }
+
+    /// Scan a list of items for `use` statements and populate the scope frame.
+    fn collect_imports_from_items(&mut self, items: &[syn::Item]) {
+        for item in items {
+            if let syn::Item::Use(use_item) = item {
+                self.collect_use_tree(&[], &use_item.tree);
+            }
+        }
+    }
+
+    /// Scan a list of statements for `use` statements and populate the scope frame.
+    fn collect_imports_from_stmts(&mut self, stmts: &[syn::Stmt]) {
+        for stmt in stmts {
+            if let syn::Stmt::Item(syn::Item::Use(use_item)) = stmt {
+                self.collect_use_tree(&[], &use_item.tree);
+            }
+        }
+    }
 }
 
 impl<'i> Context<'i> {
@@ -95,17 +173,25 @@ impl<'i> Context<'i> {
         Self::default()
     }
 
+    /// Returns (or creates) a sub-module with the given name.
+    ///
+    /// Macros registered on a sub-module are only visible when the user's source
+    /// code imports them via `use module_name::macro_name;`.
+    pub fn module(&mut self, name: impl Into<String>) -> &mut Context<'i> {
+        self.modules.entry(name.into()).or_default()
+    }
+
     /// Registers a function-like procedural macro.
     ///
     /// The macro will be invoked when encountered in expression or type position with the syntax `macro_name!(...)`,
     /// `macro_name![...]` or `macro_name!{...}`.
-    pub fn proc_macro<F, T>(&mut self, ident: String, f: F) -> &mut Self
+    pub fn proc_macro<F, T>(&mut self, ident: impl Into<String>, f: F) -> &mut Self
     where
         F: Fn(T) -> TokenStream + 'i,
         T: Parse,
     {
         self.registry.insert(
-            ident,
+            ident.into(),
             Item::ProcMacro(Box::new(move |input| match syn::parse2(input) {
                 Ok(input) => f(input),
                 Err(err) => err.to_compile_error(),
@@ -118,14 +204,14 @@ impl<'i> Context<'i> {
     ///
     /// The macro will be invoked when used as an attribute on items with the syntax `#[macro_name]` or
     /// `#[macro_name(...)]`.
-    pub fn proc_macro_attribute<F, T, U>(&mut self, ident: String, f: F) -> &mut Self
+    pub fn proc_macro_attribute<F, T, U>(&mut self, ident: impl Into<String>, f: F) -> &mut Self
     where
         F: Fn(T, U) -> TokenStream + 'i,
         T: Parse,
         U: Parse,
     {
         self.registry.insert(
-            ident,
+            ident.into(),
             Item::ProcMacroAttribute(Box::new(move |input, meta| {
                 match (syn::parse2(input), syn::parse2(meta)) {
                     (Ok(input), Ok(meta)) => f(input, meta),
@@ -141,13 +227,13 @@ impl<'i> Context<'i> {
     ///
     /// The macro will be invoked when used in a `#[derive(...)]` attribute. Generated implementations will be added
     /// after the original item.
-    pub fn proc_macro_derive<F, T>(&mut self, ident: String, f: F, attributes: Vec<String>) -> &mut Self
+    pub fn proc_macro_derive<F, T>(&mut self, ident: impl Into<String>, f: F, attributes: Vec<String>) -> &mut Self
     where
         F: Fn(T) -> TokenStream + 'i,
         T: Parse,
     {
         self.registry.insert(
-            ident,
+            ident.into(),
             Item::ProcMacroDerive(
                 Box::new(move |input| match syn::parse2(input) {
                     Ok(input) => f(input),
@@ -161,15 +247,42 @@ impl<'i> Context<'i> {
 
     pub fn transform(&self, input: TokenStream) -> TokenStream {
         let mut input = syn::parse2(input).unwrap();
-        let mut visitor = ProcMacroVisitor { ctx: self };
+        let mut visitor = ProcMacroVisitor {
+            ctx: self,
+            scopes: vec![],
+        };
         visitor.visit_file_mut(&mut input);
         quote! { #input }
     }
 
-    fn expand_item<I: ItemLike + Parse + ToTokens + Clone>(&self, mut item: I) -> Vec<I> {
+    /// Resolve a name by looking it up in the global registry first,
+    /// then walking the scope stack (respecting block vs. module boundaries).
+    fn resolve<'a>(&'a self, name: &str, scopes: &[ScopeFrame]) -> Option<&'a Item<'i>> {
+        for scope in scopes.iter().rev() {
+            if let Some(segments) = scope.imports.get(name) {
+                return self.resolve_path(segments);
+            }
+            if scope.kind == ScopeKind::Module {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Resolve a full path (e.g. ["foo", "bar"]) through the module tree.
+    fn resolve_path(&self, segments: &[String]) -> Option<&Item<'i>> {
+        let (last, modules) = segments.split_last()?;
+        let mut ctx = self;
+        for seg in modules {
+            ctx = ctx.modules.get(seg)?;
+        }
+        ctx.registry.get(last)
+    }
+
+    fn expand_item<I: ItemLike + Parse + ToTokens + Clone>(&self, mut item: I, scopes: &[ScopeFrame]) -> Vec<I> {
         for i in 0..item.attrs_mut().len() {
             let path = item.attrs_mut()[i].path().to_token_stream().to_string();
-            if let Some(Item::ProcMacroAttribute(f)) = self.registry.get(&path) {
+            if let Some(Item::ProcMacroAttribute(f)) = self.resolve(&path, scopes) {
                 let attrs = item.attrs_mut();
                 let suffix_attrs = attrs.drain(i + 1..).collect::<Vec<_>>();
                 let attr = attrs.pop().unwrap();
@@ -192,7 +305,7 @@ impl<'i> Context<'i> {
                         let mut new_attrs = prefix_attrs.clone();
                         new_attrs.extend(take(attrs));
                         *attrs = new_attrs;
-                        self.expand_item(item)
+                        self.expand_item(item, scopes)
                     })
                     .collect();
             } else if path == "derive" {
@@ -211,7 +324,7 @@ impl<'i> Context<'i> {
                     .parse2(meta_tokens)
                     .unwrap()
                     .into_iter()
-                    .partition_map::<Vec<_>, Vec<_>, _, _, _>(|ident| match self.registry.get(&ident.to_string()) {
+                    .partition_map::<Vec<_>, Vec<_>, _, _, _>(|ident| match self.resolve(&ident.to_string(), scopes) {
                         Some(Item::ProcMacroDerive(f, attrs)) => Either::Left((f, attrs)),
                         _ => Either::Right(ident),
                     });
@@ -248,7 +361,7 @@ impl<'i> Context<'i> {
                 return Some(item)
                     .into_iter()
                     .chain(output_items)
-                    .flat_map(|item| self.expand_item(item))
+                    .flat_map(|item| self.expand_item(item, scopes))
                     .collect();
             }
         }
@@ -257,7 +370,7 @@ impl<'i> Context<'i> {
             Ok(item_macro) => item_macro,
         };
         let path = item_macro.as_macro().path.to_token_stream().to_string();
-        let Some(Item::ProcMacro(f)) = self.registry.get(&path) else {
+        let Some(Item::ProcMacro(f)) = self.resolve(&path, scopes) else {
             return vec![I::from_macro(item_macro)];
         };
         let (prefix_attrs, mac) = item_macro.into_attrs_and_macro();
@@ -271,7 +384,7 @@ impl<'i> Context<'i> {
                 let mut new_attrs = prefix_attrs.clone();
                 new_attrs.extend(take(attrs));
                 *attrs = new_attrs;
-                self.expand_item(item)
+                self.expand_item(item, scopes)
             })
             .collect()
     }
@@ -303,13 +416,20 @@ impl VisitMut for DeriveVisitor {
 
 struct ProcMacroVisitor<'i> {
     ctx: &'i Context<'i>,
+    scopes: Vec<ScopeFrame>,
+}
+
+impl<'i> ProcMacroVisitor<'i> {
+    fn resolve_macro(&self, name: &str) -> Option<&Item<'i>> {
+        self.ctx.resolve(name, &self.scopes)
+    }
 }
 
 impl<'i> VisitMut for ProcMacroVisitor<'i> {
     fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
         if let syn::Expr::Macro(expr_macro) = expr {
             let path = expr_macro.mac.path.to_token_stream().to_string();
-            if let Some(Item::ProcMacro(f)) = self.ctx.registry.get(&path) {
+            if let Some(Item::ProcMacro(f)) = self.resolve_macro(&path) {
                 let input_tokens = expr_macro.mac.tokens.clone();
                 let output_tokens = f(input_tokens);
                 *expr = syn::parse2(output_tokens).unwrap();
@@ -321,7 +441,7 @@ impl<'i> VisitMut for ProcMacroVisitor<'i> {
     fn visit_type_mut(&mut self, ty: &mut syn::Type) {
         if let syn::Type::Macro(ty_macro) = ty {
             let path = ty_macro.mac.path.to_token_stream().to_string();
-            if let Some(Item::ProcMacro(f)) = self.ctx.registry.get(&path) {
+            if let Some(Item::ProcMacro(f)) = self.resolve_macro(&path) {
                 let input_tokens = ty_macro.mac.tokens.clone();
                 let output_tokens = f(input_tokens);
                 *ty = syn::parse2(output_tokens).unwrap();
@@ -331,38 +451,76 @@ impl<'i> VisitMut for ProcMacroVisitor<'i> {
     }
 
     fn visit_block_mut(&mut self, block: &mut syn::Block) {
+        let mut frame = ScopeFrame::new(ScopeKind::Block);
+        frame.collect_imports_from_stmts(&block.stmts);
+        self.scopes.push(frame);
+
         block.stmts = take(&mut block.stmts)
             .into_iter()
             .flat_map(|stmt| match stmt {
-                syn::Stmt::Item(item) => self.ctx.expand_item(item).into_iter().map(syn::Stmt::Item).collect(),
+                syn::Stmt::Item(item) => self
+                    .ctx
+                    .expand_item(item, &self.scopes)
+                    .into_iter()
+                    .map(syn::Stmt::Item)
+                    .collect(),
+                syn::Stmt::Macro(stmt_macro) => {
+                    let path = stmt_macro.mac.path.to_token_stream().to_string();
+                    if let Some(Item::ProcMacro(f)) = self.resolve_macro(&path) {
+                        let output_tokens = f(stmt_macro.mac.tokens.clone());
+                        parse_repeated::<syn::Item>(output_tokens)
+                            .unwrap()
+                            .into_iter()
+                            .map(syn::Stmt::Item)
+                            .collect()
+                    } else {
+                        vec![syn::Stmt::Macro(stmt_macro)]
+                    }
+                }
                 _ => vec![stmt],
             })
             .collect();
-        syn::visit_mut::visit_block_mut(self, block)
+        syn::visit_mut::visit_block_mut(self, block);
+
+        self.scopes.pop();
     }
 
     fn visit_file_mut(&mut self, file: &mut syn::File) {
+        let mut frame = ScopeFrame::new(ScopeKind::Module);
+        frame.collect_imports_from_items(&file.items);
+        self.scopes.push(frame);
+
         file.items = take(&mut file.items)
             .into_iter()
-            .flat_map(|item| self.ctx.expand_item(item))
+            .flat_map(|item| self.ctx.expand_item(item, &self.scopes))
             .collect();
-        syn::visit_mut::visit_file_mut(self, file)
+        syn::visit_mut::visit_file_mut(self, file);
+
+        self.scopes.pop();
     }
 
     fn visit_item_mod_mut(&mut self, item_mod: &mut syn::ItemMod) {
-        if let Some((_, items)) = &mut item_mod.content {
-            *items = take(items)
-                .into_iter()
-                .flat_map(|item| self.ctx.expand_item(item))
-                .collect();
-        }
-        syn::visit_mut::visit_item_mod_mut(self, item_mod)
+        let Some((_, items)) = &mut item_mod.content else {
+            return;
+        };
+
+        let mut frame = ScopeFrame::new(ScopeKind::Module);
+        frame.collect_imports_from_items(items);
+        self.scopes.push(frame);
+
+        *items = take(items)
+            .into_iter()
+            .flat_map(|item| self.ctx.expand_item(item, &self.scopes))
+            .collect();
+        syn::visit_mut::visit_item_mod_mut(self, item_mod);
+
+        self.scopes.pop();
     }
 
     fn visit_item_trait_mut(&mut self, item_trait: &mut syn::ItemTrait) {
         item_trait.items = take(&mut item_trait.items)
             .into_iter()
-            .flat_map(|trait_item| self.ctx.expand_item(trait_item))
+            .flat_map(|trait_item| self.ctx.expand_item(trait_item, &self.scopes))
             .collect();
         syn::visit_mut::visit_item_trait_mut(self, item_trait)
     }
@@ -370,7 +528,7 @@ impl<'i> VisitMut for ProcMacroVisitor<'i> {
     fn visit_item_impl_mut(&mut self, item_impl: &mut syn::ItemImpl) {
         item_impl.items = take(&mut item_impl.items)
             .into_iter()
-            .flat_map(|impl_item| self.ctx.expand_item(impl_item))
+            .flat_map(|impl_item| self.ctx.expand_item(impl_item, &self.scopes))
             .collect();
         syn::visit_mut::visit_item_impl_mut(self, item_impl)
     }
@@ -378,7 +536,7 @@ impl<'i> VisitMut for ProcMacroVisitor<'i> {
     fn visit_item_foreign_mod_mut(&mut self, item_foreign_mod: &mut syn::ItemForeignMod) {
         item_foreign_mod.items = take(&mut item_foreign_mod.items)
             .into_iter()
-            .flat_map(|foreign_item| self.ctx.expand_item(foreign_item))
+            .flat_map(|foreign_item| self.ctx.expand_item(foreign_item, &self.scopes))
             .collect();
         syn::visit_mut::visit_item_foreign_mod_mut(self, item_foreign_mod)
     }
